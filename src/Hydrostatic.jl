@@ -166,10 +166,7 @@ function hydrostatic_residual(dr_val::Float64 = dr; verbose::Bool = true)
     if verbose
         @printf("\n── discrete hydrostatic residual  |∇P/ρ + g|  (dr = %.1f m, N = %d cells) ──\n",
                 dr_val, N)
-        @printf("  L∞ = %.4e m/s²   L² = %.4e m/s²\n", res_linf, res_l2)
-        @printf("  relative to g = %.2f m/s²:  L∞/g = %.2e,  L²/g = %.2e\n",
-                g_acc, res_linf / g_acc, res_l2 / g_acc)
-        @printf("  (a well-balanced scheme would give ~%.1e m/s²)\n\n", eps(Float64) * g_acc)
+        @printf("  L∞ = %.4e m/s²   L² = %.4e m/s²\n\n", res_linf, res_l2)
     end
     return res_linf, res_l2
 end
@@ -200,7 +197,7 @@ function residual_field(dr_val::Float64 = dr)
 end
 
 function main()
-    @info "hydrostatic test" K P0 c_sound dt nframes
+    @info "hydrostatic test" var"1/H"=K P0 c_sound dt nframes
     # headline diagnostic: the equilibrium is not discretely balanced
     res_linf, res_l2 = hydrostatic_residual()
     sim = Simulation()

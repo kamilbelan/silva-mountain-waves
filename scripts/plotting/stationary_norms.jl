@@ -3,7 +3,7 @@
 #
 # Usage:
 #   julia --project=. scripts/plotting/stationary_norms.jl [run_dir] [out_prefix]
-#   (run_dir defaults to results/hydrostatic)
+#   (run_dir defaults to data/hydrostatic)
 #
 # Output: plots/stationary/<out_prefix>.png
 
@@ -19,7 +19,7 @@ const COL_STD = "#882255"
 const FLOOR   = 1e-16   # log-scale floor for exact-zero values
 
 # ── argument parsing ──────────────────────────────────────────────────────────
-run_dir = length(ARGS) >= 1 ? ARGS[1] : projectdir("results", "hydrostatic")
+run_dir = length(ARGS) >= 1 ? ARGS[1] : datadir("hydrostatic")
 out_prefix = length(ARGS) >= 2 ? ARGS[2] : "stationary_norms_silva"
 
 csv_path = joinpath(run_dir, "simdata.csv")
