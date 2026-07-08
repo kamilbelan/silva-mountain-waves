@@ -8,6 +8,7 @@
 /plots
 /notebooks
 /_research
+/results
 
 ################################################################################
 #                                    Julia                                     #
@@ -411,6 +412,8 @@ $RECYCLE.BIN/
 # Windows shortcuts
 *.lnk
 
+# work in progress notes
+findings.md
 
 ## Acknowledgements
 # Many thanks to `https://gitignore.io/`, written and maintained by Joe Blau, which contributed much material to this gitignore file.
