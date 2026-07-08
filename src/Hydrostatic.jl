@@ -1,301 +1,237 @@
 #=
-# ADAPTED FROM: https://github.com/OndrejKincl/LagrangianVoronoi.jl/blob/master/examples/piston.jl
+
+# Hydrostatic balance test for SILVA using LagrangianVoronoi.jl
+
+# Goal:
+- initialize the fluid at rest in an exact hydrostatic equilibrium and let the standard Lagrangian-Voronoi scheme evolve it
+- in a well-balanced scheme the velocity would stay identically zero
+- here we show that spurious velocities appear and grow, i.e. SILVA in this formulation does NOT preserve hydrostatic balance for a stratified atmosphere.
+
+# References
+- https://github.com/OndrejKincl/LagrangianVoronoi.jl
+- https://github.com/OndrejKincl/LagrangianVoronoi.jl/tree/master/examples (see examples/rayleightaylor.jl for the gravity + pressure-solver pattern)
 =#
 
-module piston
-using LagrangianVoronoi, WriteVTK, LinearAlgebra, Polyester
-using LaTeXStrings, DataFrames, CSV, Plots, Measures, Match
+module Hydrostatic
 
-const xlims = (0.0, 1.0)
-const ylims = (0.0, 0.1)
-const rho0 = 1.0
-const P0 = 1e-4
-const gamma = 5/3
-const dr = 1/100
+using LagrangianVoronoi
+using LinearAlgebra
+using Printf
 
-const CFL_early = 0.1
-const t_early = 0.01
-const CFL = 0.1
+# ---- physical parameters  --------------------------
+const g_acc  = 9.81        # gravitational acceleration 
+const R_mass = 287.05      # specific gas constant of dry air 
+const T_bg   = 250.0       # background (constant) temperature 
+const rho0   = 1.393       # reference density at z = 0 
+const gamma  = 1.4         # adiabatic index
 
-const t_end = 0.6
+const K       = g_acc / (R_mass * T_bg)       # inverse scale height of isothermal atmosphere 
+const P0      = rho0 * R_mass * T_bg          # reference pressure at z = 0 
+const c_sound = sqrt(gamma * R_mass * T_bg)   # sound speed 
+
+# analytic hydrostatic profiles 
+rho_hydro(y::Float64) = rho0 * exp(-K * y)
+P_hydro(y::Float64)   = P0   * exp(-K * y)
+
+# ---- domain: simple 2D rectangle, no mountain -----------------------------
+const xlims = (-200.0e3, 200.0e3)   # 400 km wide )
+const ylims = (0.0, 26.0e3)         # 26 km tall
+const dr    = 520.0                 # an analogue to SPH dr resolution = dom_height/50
+
+# ---- time stepping --------------------------------------------------------
+# SPH uses dt = dt_rel * h0 / c with h0 = η*dr, dt_rel = 0.1, η = 1.8 ⇒ 0.18.
+const CFL     = 0.18                 # = dt_rel * η, to match the SPH timestep
+const dt      = CFL * dr / c_sound   # CFL condition
+const t_end   = 100.0                # match the SPH stationary_norms time axis
 const nframes = 100
 
-const export_path = "results/piston"
+const export_path = "data/hydrostatic"
+
+#=
+Initial condition:
+- place every cell on the exact hydrostatic profile, at rest.
+- the internal specific energy is chosen so that the ideal EOS yields P_hydro
+=#
 
 function ic!(p::VoronoiPolygon)
-    p.rho = rho0
-    p.mass = p.rho*area(p)
-    p.P = P0
-    p.e = 0.5*norm_squared(p.v) + p.P/(p.rho*(gamma - 1.0))
+    y = p.x[2]
+    p.rho  = rho_hydro(y)
+    p.mass = p.rho * area(p)
+    p.v    = VEC0
+    p.P    = P_hydro(y)
+    p.e    = p.P / (p.rho * (gamma - 1.0))   # internal energy
 end
 
-function cut_domain!(grid::VoronoiGrid, t::Float64)
-    rect = Rectangle(xlims = (t, 1.0), ylims = ylims)
-    grid.boundary_rect = rect
-    grid.cropping_rect = rect
-    remesh!(grid)
-    @batch for p in grid.polygons
-        # change density adiabatically
-        if isleftbdarycell(p)
-            rho_old = p.rho
-            P_old = p.P
-            p.rho = p.mass/area(p)
-            p.P = P_old*(p.rho/rho_old)^gamma
-            p.e = 0.5*norm_squared(p.v) + p.P/(p.rho*(gamma - 1.0))
-        end
-    end
+# build an equilibrium grid 
+function equilibrium_grid(dr_val::Float64)
+    domain = Rectangle(xlims = xlims, ylims = ylims)
+    grid = GridNS(domain, dr_val)
+    populate_hex!(grid, ic! = ic!)
+    return grid
 end
 
-function isleftbdarycell(p::VoronoiPolygon)::Bool
-    for e in boundaries(p)
-        if e.label == BDARY_LEFT
-            return true
-        end
-    end
-    return false
-end
+# CFL timestep for a given resolution.
+timestep(dr_val::Float64) = CFL * dr_val / c_sound
 
-function dirichlet_bc!(grid::VoronoiGrid)
-    @batch for p in grid.polygons
-        if isleftbdarycell(p)
-            p.v = VECX + p.v[2]*VECY
-            p.e = 0.5*norm_squared(p.v) + p.P/(p.rho*(gamma - 1.0))
-        end
-    end
-end
+#=
+- start at exact equilibrium 
+- apply only the momentum operators that should cancel in hydrostatic balance: gravity + the implicit pressure projection.
+- after application each cell carries  v = dt_val * (total acceleration), i.e. the scheme's own discrete residual  ∇P/ρ + g  scaled by dt. 
+- no mesh motion, so positions stay on the initial equlibirum
+=#
 
-
-function move_points!(grid::VoronoiGrid,  t::Float64, dt::Float64)
-    @batch for p in grid.polygons
-        p.x += dt*p.v      
-    end
-    remesh!(grid)
-end
-
-
-function populate_skewed!(grid::VoronoiGrid{T}; ic!::Function) where T <: VoronoiPolygon
-    N = round(Int, 1.0/grid.dr)
-    M = round(Int, 0.1/grid.dr)
-    for x1 in range(-1.0, 2.0, 3N)
-        for x2 in range(0.0, 0.1, M)
-            x = RealVector(x1, x2) + 0.5*RealVector(grid.dr, grid.dr)
-            x = RealVector(x[1] + (0.1 - x[2])*sin(pi*x[1]), x[2])
-            if isinside(grid.boundary_rect, x)
-                push!(grid.polygons, T(x=x))
-            end
-        end
-    end
-    remesh!(grid)
-    @batch for p in grid.polygons
-        ic!(p)
-    end
-	return
+function residual_step!(grid::GridNS, dt_val::Float64)
+    solver = PressureSolver(grid)
+    ideal_eos!(grid, gamma)
+    gravity_step!(grid, -g_acc * VECY, dt_val)
+    find_pressure!(solver, dt_val)
+    pressure_step!(grid, dt_val)
+    return
 end
 
 mutable struct Simulation <: SimulationWorkspace
     grid::GridNS
-    solver::PressureSolver
-    E::Float64
-    S::Float64
-    t::Float64
+    solver::PressureSolver{PolygonNS}
+    # diagnostics 
+    E_kin::Float64   # total kinetic energy  
+    v_max::Float64   # maximum speed         
+    v_rms::Float64   # rms speed            
     Simulation() = begin
-        domain = Rectangle(xlims = xlims, ylims = ylims)
-        grid = GridNS(domain, dr)
-        populate_skewed!(grid, ic! = ic!)
-        solver = PressureSolver(grid)
-        dirichlet_bc!(grid)
-        return new(grid, solver, 0.0, 0.0, 0.0)
+        grid = equilibrium_grid(dr)
+        return new(grid, PressureSolver(grid), 0.0, 0.0, 0.0)
     end
 end
 
-function vbc(_::RealVector, bdary::Int)::RealVector
-    if bdary == BDARY_LEFT
-        return VECX
-    end
-    return VEC0
-end
+#=
+One time step of the standard SILVA scheme, similar as in the Rayleigh-Taylor and other examples
+=#
 
-
-function step!(sim::Simulation)
-    dt = (sim.t < t_early ? CFL_early : CFL)*dr
-    ideal_eos!(sim.grid, gamma; Pmin = P0)
-    find_pressure!(sim.solver, dt; boundary_velocity = vbc)
-    pressure_step!(sim.grid, dt)
-    find_D!(sim.grid)
-    viscous_step!(sim.grid, dt)
-    find_dv!(sim.grid, dt, 1.0)
-    relaxation_step!(sim.grid, dt)
-    dirichlet_bc!(sim.grid)
-    move_points!(sim.grid, sim.t, dt)
-    sim.t += dt
-    cut_domain!(sim.grid, sim.t)
+function step!(sim::Simulation, t::Float64)
+    grid = sim.grid
+    move!(grid, dt)
+    gravity_step!(grid, -g_acc * VECY, dt)
+    ideal_eos!(grid, gamma)
+    find_pressure!(sim.solver, dt)
+    pressure_step!(grid, dt)
+    find_D!(grid)
+    viscous_step!(grid, dt)
+    find_dv!(grid, dt)
+    relaxation_step!(grid, dt)
     return
 end
 
 #=
-Let us plot the total energy and entropy.
+Diagnostics: if the scheme were well-balanced the fluid would remain at rest,
 =#
-function postproc!(sim::Simulation)
-    sim.E = 0.0
-    sim.S = 0.0
+function postproc!(sim::Simulation, t::Float64)
+    E_kin  = 0.0
+    v_max  = 0.0   # L∞ norm of |v|
+    v2_sum = 0.0
+    N      = 0
     for p in sim.grid.polygons
-        sim.E += p.mass*p.e
-        sim.S += p.mass*log(abs(p.P/abs(p.rho)^gamma))
+        v2 = norm_squared(p.v)
+        E_kin += 0.5 * p.mass * v2
+        v_max  = max(v_max, sqrt(v2))
+        v2_sum += v2
+        N      += 1
     end
-    println("t = $(sim.t)")
-    println("energy = $(sim.E)")
-    println("entropy = $(sim.S)")
-    println()
-end
-
-function main()
-    if !ispath(export_path)
-        mkpath(export_path)
-        @info "created a new path: $(export_path)"
-    end 
-    pvd_c = paraview_collection(joinpath(export_path, "cells.pvd"))
-    pvd_p = paraview_collection(joinpath(export_path, "points.pvd"))
-    nframe = 0
-    sim = Simulation()
-    milestones = collect(range(t_end, 0.0, nframes)) # save the data here
-    vtp_vars = (:rho, :v, :e, :P, :phase, :mass)
-    while sim.t < t_end
-        step!(sim)
-        if sim.t > milestones[end]
-            @show sim.t
-            postproc!(sim)
-            println()
-            filename= joinpath(export_path, "cframe$(nframe).vtp")
-            pvd_c[sim.t] = export_grid(sim.grid, filename, vtp_vars...)
-            filename= joinpath(export_path, "pframe$(nframe).vtp")
-            pvd_p[sim.t] = export_points(sim.grid, filename, vtp_vars...)
-            pop!(milestones)
-            nframe += 1
-        end
-    end
-    vtk_save(pvd_c)
-    vtk_save(pvd_p)
-
-    x = range(0.6, 1.0, 200) 
-    rho = [point_value(sim.grid, RealVector(_x, 0.05), p -> p.rho) for _x in x]
-    P = [point_value(sim.grid, RealVector(_x, 0.05), p -> p.P) for _x in x]
-    v = [point_value(sim.grid, RealVector(_x, 0.05), p -> p.v[1]) for _x in x]
-    
-    csv_data = DataFrame(x=x, rho=rho, P=P, v=v)
-	CSV.write(string(export_path, "/linedata.csv"), csv_data)
-    plotdata()
-    print_l1_error(sim.grid)
-    println()
-    print_l2_error(sim.grid)
-end
-
-function plotdata()
-    for var in (:rho, :P, :v)
-        plotdata(var)
-    end
-end
-
-function plotdata(var::Symbol)
-    csv_data = CSV.read(string(export_path, "/linedata.csv"), DataFrame)
-    x_shock = 0.8
-    x_exact = [t_end, x_shock, nextfloat(x_shock), 1.0]
-    y_sim, ylabel, y0, y1, color = @match var begin
-        :rho => (csv_data.rho, L"\rho", 4.0, 1.0, :orange)
-        :P => (csv_data.P, L"P", 2*(gamma-1.0), P0, :royalblue)
-        :v => (csv_data.v, L"v", 1.0, 0.0, :teal)
-    end
-    y_exact = [(x <= x_shock ? y0 : y1) for x in x_exact] 
-    plt = plot(
-        x_exact,
-        y_exact,
-        label = "EXACT",
-        linewidth = 2,
-        color = :black,
-        xlabel = L"x",
-        ylabel = ylabel,
-        bottom_margin = 5mm,
-        ylims = (0.0, max(y0,y1) + 0.5)
-    )
-    plot!(plt,
-            csv_data.x,
-            y_sim,
-            label = "SIMULATION",
-            markerstrokewidth = 1,
-            markersize = 3,
-            color = color,
-            marker = :circ
-    )
-    savefig(plt, string(export_path, "/$(string(var)).pdf"))
+    sim.E_kin = E_kin
+    sim.v_max = v_max              # L∞ (max speed)
+    sim.v_rms = sqrt(v2_sum / N)   # L² (RMS speed), same convention as in SPH simulations
+    @printf("t = %8.2f s (%.1f%%)   E_kin = %.4e J   v_max = %.4e m/s\n",
+            t, 100 * t / t_end, E_kin, v_max)
     return
 end
 
-function print_l1_error(grid::VoronoiGrid)
-    x_shock = 0.8
-    for var in (:rho, :P, :v)
-        err = 0.0
-        y0, y1 = @match var begin
-            :rho => (4.0, 1.0)
-            :P => (2*(gamma-1.0), P0)
-            :v => (1.0, 0.0)
-        end
-        for p in grid.polygons
-            A = area(p)
-            y = (p.x[1] <= x_shock ? y0 : y1)
-            if (var != :v) 
-                err += A*abs(getproperty(p, var) - y)
-            else
-                err += A*abs(getproperty(p, var)[1] - y)
-            end
-        end
-        println("$(var): l1 error = $(err)")
+#=
+Discrete hydrostatic residual for diagnostics
+=#
+
+function hydrostatic_residual(dr_val::Float64 = dr; verbose::Bool = true)
+    grid   = equilibrium_grid(dr_val)
+    dt_val = timestep(dr_val)
+    residual_step!(grid, dt_val)
+
+    res_linf = 0.0
+    res2_sum = 0.0
+    N        = 0
+    for p in grid.polygons
+        a = norm(p.v) / dt_val        # net acceleration 
+        res_linf = max(res_linf, a)
+        res2_sum += a^2
+        N        += 1
     end
-end
+    res_l2 = sqrt(res2_sum / N)
 
-function print_l2_error(grid::VoronoiGrid)
-    x_shock = 0.8
-    for var in (:rho, :P, :v)
-        err = 0.0
-        y0, y1 = @match var begin
-            :rho => (4.0, 1.0)
-            :P => (2*(gamma-1.0), P0)
-            :v => (1.0, 0.0)
-        end
-        for p in grid.polygons
-            A = area(p)
-            y = (p.x[1] <= x_shock ? y0 : y1)
-            if (var != :v) 
-                err += A*abs(getproperty(p, var) - y)^2
-            else
-                err += A*abs(getproperty(p, var)[1] - y)^2
-            end
-        end
-        println("$(var): l2 error = $(sqrt(err))")
+    if verbose
+        @printf("\n── discrete hydrostatic residual  |∇P/ρ + g|  (dr = %.1f m, N = %d cells) ──\n",
+                dr_val, N)
+        @printf("  L∞ = %.4e m/s²   L² = %.4e m/s²\n", res_linf, res_l2)
+        @printf("  relative to g = %.2f m/s²:  L∞/g = %.2e,  L²/g = %.2e\n",
+                g_acc, res_linf / g_acc, res_l2 / g_acc)
+        @printf("  (a well-balanced scheme would give ~%.1e m/s²)\n\n", eps(Float64) * g_acc)
     end
+    return res_linf, res_l2
 end
 
-function linear_regression(x, y)
-    N = length(x)
-    logx = log10.(x)
-    logy = log10.(y)
-    A = [logx ones(N)]
-    b = A\logy
-    return b
+#=
+Per-cell hydrostatic residual at initialization
+- used for inconsistencies localization
+- returns positions (x, y), residual acceleration components (ax, ay), its
+magnitude (mag)
+=#
+
+function residual_field(dr_val::Float64 = dr)
+    grid   = equilibrium_grid(dr_val)
+    dt_val = timestep(dr_val)
+    residual_step!(grid, dt_val)
+
+    n   = length(grid.polygons)
+    x   = zeros(n); y   = zeros(n)
+    ax  = zeros(n); ay  = zeros(n)
+    mag = zeros(n); vol = zeros(n)
+    for (i, p) in enumerate(grid.polygons)
+        a      = p.v / dt_val
+        x[i]   = p.x[1];  y[i]   = p.x[2]
+        ax[i]  = a[1];    ay[i]  = a[2]
+        mag[i] = norm(a); vol[i] = area(p)
+    end
+    return (; x, y, ax, ay, mag, vol, dr = dr_val, dt = dt_val)
 end
 
-function make_convergence_graph()
-    data = CSV.read(joinpath(export_path, "l2_convergence_data.csv"), DataFrame)
-    x = log10.(data.N)
-    y = [log10.(data.rho) log10.(data.P) log10.(data.v)]
-    eoc_rho = linear_regression(data.N, data.rho)[1]
-    eoc_p = linear_regression(data.N, data.P)[1]
-    eoc_v = linear_regression(data.N, data.v)[1]
-    xlabel = L"\log N"
-    ylabel = L"\log \epsilon"
-    rho_label = L"\rho"*"   (EOC = $(-round(eoc_rho, digits=2)))"
-    p_label = L"p"*"   (EOC = $(-round(eoc_p, digits=2)))"
-    v_label = L"v"*"   (EOC = $(-round(eoc_v, digits=2)))"
-    plt = plot(x, y, xlabel=xlabel, ylabel=ylabel, label = [rho_label p_label v_label], marker = :hex, axis_ratio = 1.0)
-    savefig(plt, joinpath(export_path, "l2_convergence.pdf"))
+function main()
+    @info "hydrostatic test" K P0 c_sound dt nframes
+    # headline diagnostic: the equilibrium is not discretely balanced
+    res_linf, res_l2 = hydrostatic_residual()
+    sim = Simulation()
+    run!(sim, dt, t_end, step!,
+        path      = export_path,
+        vtp_vars  = (:rho, :P, :v, :e),
+        csv_vars  = (:E_kin, :v_max, :v_rms),
+        postproc! = postproc!,
+        nframes   = nframes,
+    )
+    return (; res_linf, res_l2, E_kin = sim.E_kin, v_max = sim.v_max, v_rms = sim.v_rms)
 end
 
+# driver for the repl
+if abspath(PROGRAM_FILE) == @__FILE__
+    main()
 end
+
+######
+
+#=
+COMPATIBILITY HOTFIX
+- the installed LagrangianVoronoi defines `rmul!(::ThreadedVec{T}, ::T)`, which is ambiguous with `LinearAlgebra.rmul!(::AbstractArray, ::Number)` 
+=#
+function LinearAlgebra.rmul!(x::LagrangianVoronoi.ThreadedVec{T}, val::Number) where {T}
+    v = convert(T, val)
+    @inbounds for i in eachindex(x.val)
+        x.val[i] *= v
+    end
+    return x
+end
+
+
+end # module Hydrostatic
